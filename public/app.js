@@ -315,11 +315,22 @@ async function startSeasonDownload(movieId, seriesTitle, season) {
       throw new Error(data.error || 'Failed to start download job');
     }
 
+    jobBadge.style.background = '';
+    jobBadge.style.color = '';
+
     // Start Polling Job Status
     pollJobProgress(data.jobId);
   } catch (err) {
-    jobStatusText.textContent = `Error: ${err.message}`;
-    jobBadge.textContent = 'FAILED';
+    jobStatusText.textContent = err.message;
+    if (err.message.includes('cooling down') || err.message.includes('currently processing')) {
+      jobBadge.textContent = 'SERVER BUSY';
+      jobBadge.style.background = '#f59e0b';
+      jobBadge.style.color = '#000';
+    } else {
+      jobBadge.textContent = 'FAILED';
+      jobBadge.style.background = '';
+      jobBadge.style.color = '';
+    }
     showToast(err.message);
   }
 }

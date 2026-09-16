@@ -40,6 +40,14 @@ app.use(express.static(path.join(__dirname, 'public')));
 const jobs = new Map();
 let featuredCache = { data: null, timestamp: 0 };
 
+// Server Single-Job Lock & Cooldown to prevent Render memory crashes
+let activeJobId = null;
+let activeJobStartedAt = 0;
+let lastJobCompletedAt = 0;
+const COOLDOWN_MINUTES = 5; // 5-minute interval between heavy downloads
+const COOLDOWN_MS = COOLDOWN_MINUTES * 60 * 1000;
+const JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30-minute safety timeout
+
 // Helper: Run FFmpeg process with memory-safe arguments and detailed error/signal reporting
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
@@ -215,17 +223,108 @@ app.get('/api/detail', async (req, res) => {
   }
 });
 
-// API: Start Season Download Job
+// API: Server Queue & Health Status
+app.get('/api/server-queue-status', (req, res) => {
+  const isBusy = !!activeJobId && jobs.has(activeJobId);
+  const activeJob = isBusy ? jobs.get(activeJobId) : null;
+  const now = Date.now();
+  let remainingCooldownSec = 0;
+
+  if (!isBusy && lastJobCompletedAt > 0) {
+    const elapsed = now - lastJobCompletedAt;
+    if (elapsed < COOLDOWN_MS) {
+      remainingCooldownSec = Math.ceil((COOLDOWN_MS - elapsed) / 1000);
+    }
+  }
+
+  res.json({
+    status: true,
+    isBusy,
+    activeJob: activeJob ? {
+      title: activeJob.seriesTitle,
+      season: activeJob.season,
+      progress: activeJob.progress,
+      status: activeJob.status
+    } : null,
+    inCooldown: remainingCooldownSec > 0,
+    remainingCooldownSec
+  });
+});
+
+// API: Start Season Download Job (strictly 1 active job at a time + 5-min stability interval)
 app.post('/api/download-season', async (req, res) => {
   const { movieId, seriesTitle, season } = req.body;
   if (!movieId || !season) {
     return res.status(400).json({ status: false, error: 'movieId and season are required' });
   }
 
-  const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const cleanTitle = (seriesTitle || 'Show').replace(/[^a-zA-Z0-9 _-]/g, '').trim();
   const finalFileName = `${cleanTitle} S${season}.mp4`;
   const finalFilePath = path.join(DOWNLOADS_DIR, finalFileName);
+
+  // 1. Instant Cache: Check if already downloaded on server
+  if (fs.existsSync(finalFilePath) && fs.statSync(finalFilePath).size > 1000000) {
+    const sizeMB = (fs.statSync(finalFilePath).size / 1024 / 1024).toFixed(1);
+    const cachedJobId = `job_cached_${Date.now()}`;
+    jobs.set(cachedJobId, {
+      jobId: cachedJobId,
+      movieId,
+      seriesTitle: cleanTitle,
+      season: Number(season),
+      status: 'completed',
+      progress: 100,
+      totalEpisodes: 1,
+      currentEpisode: 1,
+      message: `Completed! Instant download from server cache (${sizeMB} MB)`,
+      finalFileName,
+      fileUrl: `/api/download-file/${encodeURIComponent(finalFileName)}`,
+      fileSizeMB: sizeMB,
+      error: null
+    });
+    return res.json({ status: true, jobId: cachedJobId, cached: true });
+  }
+
+  const now = Date.now();
+
+  // 2. Mutual Exclusion: Check if another download is currently processing
+  if (activeJobId) {
+    const activeJob = jobs.get(activeJobId);
+    // Timeout safeguard: If active job ran over 30 mins, unlock
+    if (activeJobStartedAt && (now - activeJobStartedAt > JOB_TIMEOUT_MS)) {
+      console.warn(`[Queue] Active job ${activeJobId} timed out. Resetting lock.`);
+      activeJobId = null;
+    } else if (activeJob && ['fetching_episodes', 'downloading', 'merging', 'queued'].includes(activeJob.status)) {
+      // If user requested the same show & season, return active job to track
+      if (String(activeJob.movieId) === String(movieId) && Number(activeJob.season) === Number(season)) {
+        return res.json({ status: true, jobId: activeJob.jobId, inProgress: true });
+      }
+
+      return res.status(429).json({
+        status: false,
+        error: `Server is currently processing "${activeJob.seriesTitle} Season ${activeJob.season}" (${activeJob.progress}%). To prevent server crashes, only 1 download is processed at a time. Please wait until it completes.`
+      });
+    } else {
+      activeJobId = null;
+    }
+  }
+
+  // 3. Stability Interval: Check 5-minute cool-down interval after last completed job
+  if (lastJobCompletedAt > 0) {
+    const elapsed = now - lastJobCompletedAt;
+    if (elapsed < COOLDOWN_MS) {
+      const remainingSec = Math.ceil((COOLDOWN_MS - elapsed) / 1000);
+      const remainingMin = Math.ceil(remainingSec / 60);
+      return res.status(429).json({
+        status: false,
+        error: `Server is cooling down to ensure stability after the previous download. Next download will be accepted in ${remainingMin}m (${remainingSec}s).`
+      });
+    }
+  }
+
+  // 4. Accept New Job and acquire lock
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  activeJobId = jobId;
+  activeJobStartedAt = Date.now();
 
   jobs.set(jobId, {
     jobId,
@@ -358,6 +457,11 @@ async function executeDownloadJob(jobId, movieId, title, season, finalFilePath, 
     job.fileUrl = `/api/download-file/${encodeURIComponent(finalFileName)}`;
     job.fileSizeMB = sizeMB;
 
+    // Release lock and start 5-minute cool-down period for stability
+    activeJobId = null;
+    lastJobCompletedAt = Date.now();
+    console.log(`[Queue] Job ${jobId} completed successfully. Server entered ${COOLDOWN_MINUTES}-minute stability cooldown.`);
+
     // Clean up temporary files
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -367,6 +471,12 @@ async function executeDownloadJob(jobId, movieId, title, season, finalFilePath, 
     job.status = 'failed';
     job.error = err.message;
     job.message = `Download failed: ${err.message}`;
+
+    // Release lock on error, allow retry after 1 minute
+    activeJobId = null;
+    lastJobCompletedAt = Date.now() - (COOLDOWN_MS - 60000);
+    console.warn(`[Queue] Job ${jobId} failed: ${err.message}. Lock released.`);
+
     try {
       if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
     } catch {}

@@ -6,6 +6,8 @@ const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3030;
+const API_BASE = process.env.API_BASE || 'https://alright-tv-premium.wasmer.app/api.php';
+const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR || path.join(__dirname, 'downloads');
 
 // Cross-platform FFmpeg resolver (Render Linux + local Windows)
 let FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
@@ -30,11 +32,19 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Range']
+  methods: ['GET', 'POST', 'OPTIONS', 'HEAD'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Range', 'Origin', 'Accept']
 }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Health checks for Render
+app.get('/healthz', (req, res) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
+});
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
+});
 
 // In-memory active job tracker & cache
 const jobs = new Map();
@@ -490,7 +500,7 @@ app.get('/api/job-status/:jobId', (req, res) => {
   res.json({ status: true, job });
 });
 
-// API: File Download Stream
+// API: File Download Attachment Stream
 app.get('/api/download-file/:filename', (req, res) => {
   const filename = req.params.filename;
   const filePath = path.join(DOWNLOADS_DIR, filename);
@@ -502,6 +512,53 @@ app.get('/api/download-file/:filename', (req, res) => {
   res.download(filePath, filename);
 });
 
-app.listen(PORT, () => {
-  console.log(`Alright TV Downloader server running at http://localhost:${PORT}`);
+// API: File Media Player Stream with HTTP 206 Partial Content (Range) Support
+app.get('/api/stream-file/:filename', (req, res) => {
+  const filename = req.params.filename;
+  const filePath = path.join(DOWNLOADS_DIR, filename);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).send('File not found or expired.');
+  }
+
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = (end - start) + 1;
+    const file = fs.createReadStream(filePath, { start, end });
+    const head = {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': 'video/mp4',
+    };
+    res.writeHead(206, head);
+    file.pipe(res);
+  } else {
+    const head = {
+      'Content-Length': fileSize,
+      'Content-Type': 'video/mp4',
+      'Accept-Ranges': 'bytes'
+    };
+    res.writeHead(200, head);
+    fs.createReadStream(filePath).pipe(res);
+  }
+});
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Alright TV Downloader server running on 0.0.0.0:${PORT} (env: ${process.env.NODE_ENV || 'production'})`);
+});
+
+// Graceful termination for Render deployments
+process.on('SIGTERM', () => {
+  console.log('[Server] SIGTERM received. Closing gracefully...');
+  server.close(() => {
+    console.log('[Server] Process closed.');
+    process.exit(0);
+  });
 });

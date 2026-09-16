@@ -363,6 +363,31 @@ app.get('/api/detail', async (req, res) => {
   }
 });
 
+// API: Stream signed URL proxy
+app.get('/api/stream', async (req, res) => {
+  const { movieId, episodeId, hlsFileName, seasonNumber, episodeNumber } = req.query;
+  try {
+    const data = await fetchWithRetry(
+      `${API_BASE}?action=stream&movieId=${encodeURIComponent(movieId || '')}&episodeId=${encodeURIComponent(episodeId || '')}&hlsFileName=${encodeURIComponent(hlsFileName || '')}&seasonNumber=${seasonNumber || 1}&episodeNumber=${episodeNumber || 1}&_=${Date.now()}`
+    );
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ status: false, error: err.message });
+  }
+});
+
+// API: Universal proxy for mobile app failover
+app.all(['/api.php', '/api/proxy'], async (req, res) => {
+  const query = req.url.includes('?') ? req.url.split('?')[1] : '';
+  const targetUrl = `${API_BASE}${query ? '?' + query : ''}`;
+  try {
+    const data = await fetchWithRetry(targetUrl);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ status: false, error: err.message });
+  }
+});
+
 // API: Server Queue & Health Status
 app.get('/api/server-queue-status', (req, res) => {
   const isBusy = !!activeJobId && jobs.has(activeJobId);

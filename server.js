@@ -13,19 +13,17 @@ try {
   const ffmpegStatic = require('ffmpeg-static');
   if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
     FFMPEG_PATH = ffmpegStatic;
+    try {
+      fs.chmodSync(FFMPEG_PATH, 0o755);
+    } catch (_) {}
   }
-} catch (_) {}
-
-if (process.platform === 'win32') {
-  const localGyan = 'C:\\Users\\ysubh\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-9.0.1-full_build\\bin\\ffmpeg.exe';
-  if (fs.existsSync(localGyan)) {
-    FFMPEG_PATH = localGyan;
-  }
+} catch (e) {
+  console.warn('ffmpeg-static not found, falling back to system ffmpeg');
 }
 
-const API_BASE = 'https://alright-tv-premium.wasmer.app/api.php';
-const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
+console.log(`[FFmpeg] Configured binary path: ${FFMPEG_PATH}`);
 
+// Ensure downloads directory exists
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 }
@@ -42,17 +40,41 @@ app.use(express.static(path.join(__dirname, 'public')));
 const jobs = new Map();
 let featuredCache = { data: null, timestamp: 0 };
 
-// Helper: Run FFmpeg process
+// Helper: Run FFmpeg process with memory-safe arguments and detailed error/signal reporting
 function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(FFMPEG_PATH, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    // Add memory and stability flags: single thread to prevent OOM on Render 512MB RAM
+    const safeArgs = [
+      '-hide_banner',
+      '-loglevel', 'error',
+      ...args
+    ];
+
+    const proc = spawn(FFMPEG_PATH, safeArgs, { 
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env }
+    });
+
     let stderr = '';
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`FFmpeg exited with code ${code}: ${stderr.slice(-400)}`));
+    proc.on('close', (code, signal) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        const errorDetail = stderr.trim() || `Process terminated with signal: ${signal || 'none'}`;
+        reject(new Error(`FFmpeg exited with code ${code} (signal: ${signal}): ${errorDetail}`));
+      }
     });
-    proc.on('error', reject);
+    proc.on('error', (err) => {
+      // Fallback attempt with system 'ffmpeg' if ffmpeg-static fails
+      if (FFMPEG_PATH !== 'ffmpeg') {
+        console.warn(`[FFmpeg] Failed with ${FFMPEG_PATH}, retrying with system ffmpeg...`);
+        FFMPEG_PATH = 'ffmpeg';
+        runFFmpeg(args).then(resolve).catch(reject);
+      } else {
+        reject(err);
+      }
+    });
   });
 }
 
@@ -252,42 +274,51 @@ async function executeDownloadJob(jobId, movieId, title, season, finalFilePath, 
     }
 
     const downloadedFiles = new Array(episodes.length);
-    const CONCURRENCY = 3;
+    // Sequential download to avoid Render Free Tier 512MB RAM OOM limits
+    const CONCURRENCY = 1;
 
     for (let i = 0; i < episodes.length; i += CONCURRENCY) {
       const chunk = episodes.slice(i, i + CONCURRENCY);
-      await Promise.all(
-        chunk.map(async (ep, idx) => {
-          const overallIdx = i + idx;
-          const epPad = String(ep.episodeNumber || (overallIdx + 1)).padStart(2, '0');
-          const outFile = path.join(tempDir, `ep_${epPad}.mp4`);
+      for (let idx = 0; idx < chunk.length; idx++) {
+        const ep = chunk[idx];
+        const overallIdx = i + idx;
+        const epPad = String(ep.episodeNumber || (overallIdx + 1)).padStart(2, '0');
+        const outFile = path.join(tempDir, `ep_${epPad}.mp4`);
 
-          // Fetch signed stream URL
-          const streamData = await fetchWithRetry(
-            `${API_BASE}?action=stream&movieId=${movieId}&episodeId=${ep.id}&hlsFileName=${ep.hlsFileName}&seasonNumber=${season}&episodeNumber=${ep.episodeNumber}`
-          );
+        // Fetch signed stream URL
+        const streamData = await fetchWithRetry(
+          `${API_BASE}?action=stream&movieId=${movieId}&episodeId=${ep.id}&hlsFileName=${ep.hlsFileName}&seasonNumber=${season}&episodeNumber=${ep.episodeNumber}`
+        );
 
-          if (!streamData.status || !streamData.streams || !streamData.streams[0]?.signedVideoUrl) {
-            throw new Error(`Failed to fetch signed stream URL for episode ${ep.episodeNumber}`);
-          }
+        if (!streamData.status || !streamData.streams || !streamData.streams[0]?.signedVideoUrl) {
+          throw new Error(`Failed to fetch signed stream URL for episode ${ep.episodeNumber}`);
+        }
 
-          const m3u8Url = streamData.streams[0].signedVideoUrl;
+        const m3u8Url = streamData.streams[0].signedVideoUrl;
 
-          // Download stream directly as mp4
-          await runFFmpeg([
-            '-y',
-            '-i', m3u8Url,
-            '-c', 'copy',
-            '-f', 'mp4',
-            outFile
-          ]);
+        // Download stream memory-safely with reconnection and AAC bitstream fix
+        await runFFmpeg([
+          '-y',
+          '-threads', '1',
+          '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+          '-reconnect', '1',
+          '-reconnect_at_eof', '1',
+          '-reconnect_streamed', '1',
+          '-reconnect_delay_max', '5',
+          '-headers', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n',
+          '-i', m3u8Url,
+          '-c', 'copy',
+          '-bsf:a', 'aac_adtstoasc',
+          '-movflags', '+faststart',
+          '-f', 'mp4',
+          outFile
+        ]);
 
-          downloadedFiles[overallIdx] = outFile;
-          job.currentEpisode++;
-          job.progress = Math.round((job.currentEpisode / episodes.length) * 85);
-          job.message = `Downloaded ${job.currentEpisode} / ${episodes.length} episodes (1080p)...`;
-        })
-      );
+        downloadedFiles[overallIdx] = outFile;
+        job.currentEpisode++;
+        job.progress = Math.round((job.currentEpisode / episodes.length) * 85);
+        job.message = `Downloaded ${job.currentEpisode} / ${episodes.length} episodes...`;
+      }
     }
 
     // Step: Concatenate all episodes into single video
@@ -305,10 +336,12 @@ async function executeDownloadJob(jobId, movieId, title, season, finalFilePath, 
 
     await runFFmpeg([
       '-y',
+      '-threads', '1',
       '-f', 'concat',
       '-safe', '0',
       '-i', concatListPath,
       '-c', 'copy',
+      '-movflags', '+faststart',
       finalFilePath
     ]);
 

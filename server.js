@@ -110,42 +110,43 @@ async function fetchWithRetry(url, retries = 5, delay = 2000) {
   }
 }
 
-// Helper: Stream HLS directly to local disk with Node.js fetch (completely avoids FFmpeg glibc DNS/TLS SIGSEGV crashes on Render)
-async function downloadHlsToMp4(m3u8Url, outFile, tempDir) {
-  // 1. Fetch master or media m3u8 playlist with native Node.js fetch
-  const masterRes = await fetch(m3u8Url);
-  if (!masterRes.ok) throw new Error(`Failed to load m3u8: HTTP ${masterRes.status}`);
-  let m3u8Text = await masterRes.text();
+// Helper to download playlist segments (handles both #EXT-X-MAP init.mp4 header and .m4s/.ts fragments)
+async function downloadPlaylistSegments(playlistUrl, outFilePath) {
+  const res = await fetch(playlistUrl);
+  if (!res.ok) throw new Error(`Failed to fetch playlist: HTTP ${res.status}`);
+  const text = await res.text();
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
 
-  let mediaUrl = m3u8Url;
-  const lines = m3u8Text.split('\n').map(l => l.trim()).filter(Boolean);
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
-      const next = lines[i + 1];
-      if (next && !next.startsWith('#')) {
-        mediaUrl = next.startsWith('http') ? next : new URL(next, m3u8Url).href;
-      }
-    }
+  // Check for #EXT-X-MAP:URI="..." (CMAF / fMP4 initialization header containing ftyp & moov)
+  let initUrl = null;
+  const mapLine = lines.find(l => l.startsWith('#EXT-X-MAP'));
+  if (mapLine) {
+    const match = mapLine.match(/URI="([^"]+)"/);
+    if (match) initUrl = new URL(match[1], playlistUrl).href;
   }
 
-  if (mediaUrl !== m3u8Url) {
-    const subRes = await fetch(mediaUrl);
-    if (!subRes.ok) throw new Error(`Failed to load sub-m3u8: HTTP ${subRes.status}`);
-    m3u8Text = await subRes.text();
+  // Extract media segment URLs
+  const segUrls = lines
+    .filter(l => !l.startsWith('#'))
+    .map(l => l.startsWith('http') ? l : new URL(l, playlistUrl).href);
+
+  if (!initUrl && segUrls.length === 0) {
+    throw new Error('No valid segments or initialization maps found in playlist');
   }
 
-  // 2. Extract segment URLs
-  const segLines = m3u8Text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-  if (segLines.length === 0) throw new Error('No video segments found in m3u8 playlist');
+  const outStream = fs.createWriteStream(outFilePath);
 
-  const segmentUrls = segLines.map(line => line.startsWith('http') ? line : new URL(line, mediaUrl).href);
+  // 1. Write initialization header first (contains tfhd & moov required by MP4 container)
+  if (initUrl) {
+    const initRes = await fetch(initUrl);
+    if (!initRes.ok) throw new Error(`Failed to fetch init header: HTTP ${initRes.status}`);
+    const initBuf = Buffer.from(await initRes.arrayBuffer());
+    outStream.write(initBuf);
+  }
 
-  // 3. Download segments sequentially to local temp .ts file (minimal memory footprint)
-  const tempTs = path.join(tempDir, `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.ts`);
-  const outStream = fs.createWriteStream(tempTs);
-
-  for (let s = 0; s < segmentUrls.length; s++) {
-    const sUrl = segmentUrls[s];
+  // 2. Write sequential media segments (.m4s / .ts)
+  for (let i = 0; i < segUrls.length; i++) {
+    const sUrl = segUrls[i];
     let success = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -156,7 +157,7 @@ async function downloadHlsToMp4(m3u8Url, outFile, tempDir) {
         success = true;
         break;
       } catch (err) {
-        if (attempt === 2) throw new Error(`Segment ${s + 1}/${segmentUrls.length} failed: ${err.message}`);
+        if (attempt === 2) throw new Error(`Segment ${i + 1}/${segUrls.length} failed: ${err.message}`);
         await new Promise(r => setTimeout(r, 1000));
       }
     }
@@ -166,20 +167,76 @@ async function downloadHlsToMp4(m3u8Url, outFile, tempDir) {
     outStream.end(resolve);
     outStream.on('error', reject);
   });
+}
 
-  // 4. Remux local .ts file to .mp4 using FFmpeg locally (no network calls, zero DNS, zero SIGSEGV)
+// Helper: Stream HLS directly to local disk with Node.js fetch (fMP4/CMAF init-map & dual audio/video muxing)
+async function downloadHlsToMp4(masterUrl, outFile, tempDir) {
+  const masterRes = await fetch(masterUrl);
+  if (!masterRes.ok) throw new Error(`Failed to fetch master playlist: HTTP ${masterRes.status}`);
+  const masterText = await masterRes.text();
+
+  // 1. Detect Audio Track from Master Playlist
+  let audioPlaylistUrl = null;
+  const audioLine = masterText.split('\n').find(l => l.includes('TYPE=AUDIO') && l.includes('URI='));
+  if (audioLine) {
+    const audioMatch = audioLine.match(/URI="([^"]+)"/);
+    if (audioMatch) audioPlaylistUrl = new URL(audioMatch[1], masterUrl).href;
+  }
+
+  // 2. Detect 1080p or Highest Resolution Video Track
+  let videoPlaylistUrl = masterUrl;
+  const mLines = masterText.split('\n').map(l => l.trim()).filter(Boolean);
+  for (let i = 0; i < mLines.length; i++) {
+    if (mLines[i].startsWith('#EXT-X-STREAM-INF')) {
+      const nextLine = mLines[i + 1];
+      if (nextLine && !nextLine.startsWith('#')) {
+        videoPlaylistUrl = nextLine.startsWith('http') ? nextLine : new URL(nextLine, masterUrl).href;
+      }
+    }
+  }
+
+  const randomId = Math.random().toString(36).slice(2, 7);
+  const tempVideoPath = path.join(tempDir, `vid_${Date.now()}_${randomId}.mp4`);
+  const tempAudioPath = path.join(tempDir, `aud_${Date.now()}_${randomId}.mp4`);
+
   try {
-    await runFFmpeg([
-      '-y',
-      '-threads', '1',
-      '-i', tempTs,
-      '-c', 'copy',
-      '-bsf:a', 'aac_adtstoasc',
-      '-movflags', '+faststart',
-      outFile
-    ]);
+    // Download Video Track (with init.mp4 box)
+    await downloadPlaylistSegments(videoPlaylistUrl, tempVideoPath);
+
+    // Download Audio Track (with init.mp4 box) if available
+    if (audioPlaylistUrl) {
+      await downloadPlaylistSegments(audioPlaylistUrl, tempAudioPath);
+    }
+
+    // Local Mux with FFmpeg (zero network calls, zero DNS, zero SIGSEGV)
+    if (audioPlaylistUrl && fs.existsSync(tempAudioPath) && fs.statSync(tempAudioPath).size > 1000) {
+      await runFFmpeg([
+        '-y',
+        '-threads', '1',
+        '-i', tempVideoPath,
+        '-i', tempAudioPath,
+        '-c:v', 'copy',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        outFile
+      ]);
+    } else {
+      await runFFmpeg([
+        '-y',
+        '-threads', '1',
+        '-i', tempVideoPath,
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        outFile
+      ]);
+    }
+
+    if (!fs.existsSync(outFile) || fs.statSync(outFile).size < 100000) {
+      throw new Error('Episode remux verification failed: output file missing or incomplete');
+    }
   } finally {
-    try { if (fs.existsSync(tempTs)) fs.unlinkSync(tempTs); } catch (_) {}
+    try { if (fs.existsSync(tempVideoPath)) fs.unlinkSync(tempVideoPath); } catch (_) {}
+    try { if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath); } catch (_) {}
   }
 }
 

@@ -1,8 +1,11 @@
 'use strict';
 
 // Backend API configuration:
-// Automatically uses relative URL when hosted unified on Render, or connects to external production backend URL
-const BACKEND_URL = window.ALRIGHT_BACKEND_URL || localStorage.getItem('ALRIGHT_BACKEND_URL') || '';
+// Defaults to current origin when hosted unified on Render, or auto-routes to Render when hosted on free.nf
+const DEFAULT_RENDER_BACKEND = 'https://alrighttv-downloader.onrender.com';
+const BACKEND_URL = window.ALRIGHT_BACKEND_URL 
+  || localStorage.getItem('ALRIGHT_BACKEND_URL') 
+  || (window.location.hostname.includes('free.nf') ? DEFAULT_RENDER_BACKEND : '');
 
 function apiUrl(endpoint) {
   if (!BACKEND_URL) return endpoint;

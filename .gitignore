@@ -1,0 +1,16 @@
+# Dependency directories
+node_modules/
+
+# Local video downloads & temp clips
+downloads/*.mp4
+downloads/*.ts
+temp_*
+*.tmp
+
+# Environment variables
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db

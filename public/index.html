@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Alright TV Downloader | Automated Season Grabber</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="top-nav">
+      <div class="brand">
+        <div class="brand-badge">⚡ 1080p Full HD</div>
+        <h1>Alright TV Downloader</h1>
+      </div>
+      <div class="header-tagline">Browse trending shows, new releases & dramas or search any series to download full seasons in 1080p</div>
+    </header>
+
+    <!-- Search Section (Empty by default, no pre-filled title) -->
+    <section class="search-section">
+      <form id="searchForm" class="search-box">
+        <div class="search-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.2" y2="16.2"/></svg>
+        </div>
+        <input 
+          type="text" 
+          id="searchInput" 
+          placeholder="Search any show, actor, or drama (e.g. Dabangg Bodyguard, Sauda Ishq Ka)..." 
+          autocomplete="off"
+        >
+        <button type="button" id="clearSearchBtn" class="clear-search-btn hidden" title="Clear Search">✕</button>
+        <button type="submit" id="searchBtn" class="primary-btn">Search</button>
+      </form>
+    </section>
+
+    <!-- Category Filters Navigation Chips -->
+    <nav id="categoryChips" class="category-chips">
+      <button class="chip active" data-cat="all">🌟 All Featured</button>
+      <button class="chip" data-cat="new_releases">⭐ New Releases</button>
+      <button class="chip" data-cat="trending">🔥 Trending</button>
+      <button class="chip" data-cat="romance">💖 Romantic Dramas</button>
+      <button class="chip" data-cat="ceo">👑 CEO Dramas</button>
+      <button class="chip" data-cat="binge">🍿 Binge Worthy</button>
+    </nav>
+
+    <!-- Live Active Job Tracker Card -->
+    <section id="jobCard" class="job-card hidden">
+      <div class="job-header">
+        <div class="job-info">
+          <div class="job-badge" id="jobBadge">PROCESSING</div>
+          <h3 id="jobTitle">Series - Season</h3>
+        </div>
+        <div class="job-percentage" id="jobPercentage">0%</div>
+      </div>
+      <div class="progress-track">
+        <div class="progress-bar" id="progressBar" style="width: 0%;"></div>
+      </div>
+      <div class="job-footer">
+        <span class="job-status-text" id="jobStatusText">Starting download...</span>
+        <a id="downloadFileBtn" class="download-ready-btn hidden" href="#" download>
+          ⬇ Save Video (.mp4)
+        </a>
+      </div>
+    </section>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+      <!-- Search Mode Header (Only shown when searching) -->
+      <div id="searchHeaderRow" class="section-title-row hidden">
+        <div>
+          <h2 id="searchResultsHeading">Search Results</h2>
+          <span id="searchResultsCount" class="results-count"></span>
+        </div>
+        <button id="backToFeaturedBtn" class="secondary-btn">← Back to Featured</button>
+      </div>
+
+      <!-- Search Results Grid -->
+      <div id="searchResultsGrid" class="results-grid hidden"></div>
+
+      <!-- Featured Sections Container (Default View) -->
+      <div id="featuredSectionsContainer" class="featured-container">
+        <!-- Dynamically injected category rails -->
+      </div>
+
+      <!-- Loading State -->
+      <div id="loadingSpinner" class="spinner-container">
+        <div class="spinner"></div>
+        <p id="spinnerText">Loading new releases & dramas from Alright TV...</p>
+      </div>
+
+      <!-- Empty State -->
+      <div id="emptyState" class="empty-state hidden">
+        <div class="empty-icon">📺</div>
+        <h3>No matching shows found</h3>
+        <p>Try searching with another keyword or pick one of the featured shows above.</p>
+        <button class="primary-btn" onclick="resetToFeatured()" style="margin-top:16px;">View All Featured Shows</button>
+      </div>
+    </main>
+
+    <!-- Season Selector Modal -->
+    <div id="seasonModal" class="modal-backdrop hidden">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title-area">
+            <h3 id="modalShowTitle">Show Title</h3>
+            <span id="modalMeta" class="modal-meta">Total Seasons: 1</span>
+          </div>
+          <button id="closeModalBtn" class="close-modal-btn">✕</button>
+        </div>
+
+        <div class="modal-body">
+          <div class="season-selector-label">Choose Season to Download (1080p Full HD):</div>
+          <div id="seasonsList" class="seasons-list">
+            <!-- Dynamically populated season cards -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast message -->
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

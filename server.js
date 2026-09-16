@@ -110,6 +110,79 @@ async function fetchWithRetry(url, retries = 5, delay = 2000) {
   }
 }
 
+// Helper: Stream HLS directly to local disk with Node.js fetch (completely avoids FFmpeg glibc DNS/TLS SIGSEGV crashes on Render)
+async function downloadHlsToMp4(m3u8Url, outFile, tempDir) {
+  // 1. Fetch master or media m3u8 playlist with native Node.js fetch
+  const masterRes = await fetch(m3u8Url);
+  if (!masterRes.ok) throw new Error(`Failed to load m3u8: HTTP ${masterRes.status}`);
+  let m3u8Text = await masterRes.text();
+
+  let mediaUrl = m3u8Url;
+  const lines = m3u8Text.split('\n').map(l => l.trim()).filter(Boolean);
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+      const next = lines[i + 1];
+      if (next && !next.startsWith('#')) {
+        mediaUrl = next.startsWith('http') ? next : new URL(next, m3u8Url).href;
+      }
+    }
+  }
+
+  if (mediaUrl !== m3u8Url) {
+    const subRes = await fetch(mediaUrl);
+    if (!subRes.ok) throw new Error(`Failed to load sub-m3u8: HTTP ${subRes.status}`);
+    m3u8Text = await subRes.text();
+  }
+
+  // 2. Extract segment URLs
+  const segLines = m3u8Text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+  if (segLines.length === 0) throw new Error('No video segments found in m3u8 playlist');
+
+  const segmentUrls = segLines.map(line => line.startsWith('http') ? line : new URL(line, mediaUrl).href);
+
+  // 3. Download segments sequentially to local temp .ts file (minimal memory footprint)
+  const tempTs = path.join(tempDir, `stream_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.ts`);
+  const outStream = fs.createWriteStream(tempTs);
+
+  for (let s = 0; s < segmentUrls.length; s++) {
+    const sUrl = segmentUrls[s];
+    let success = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const segRes = await fetch(sUrl);
+        if (!segRes.ok) throw new Error(`HTTP ${segRes.status}`);
+        const buf = Buffer.from(await segRes.arrayBuffer());
+        outStream.write(buf);
+        success = true;
+        break;
+      } catch (err) {
+        if (attempt === 2) throw new Error(`Segment ${s + 1}/${segmentUrls.length} failed: ${err.message}`);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+  }
+
+  await new Promise((resolve, reject) => {
+    outStream.end(resolve);
+    outStream.on('error', reject);
+  });
+
+  // 4. Remux local .ts file to .mp4 using FFmpeg locally (no network calls, zero DNS, zero SIGSEGV)
+  try {
+    await runFFmpeg([
+      '-y',
+      '-threads', '1',
+      '-i', tempTs,
+      '-c', 'copy',
+      '-bsf:a', 'aac_adtstoasc',
+      '-movflags', '+faststart',
+      outFile
+    ]);
+  } finally {
+    try { if (fs.existsSync(tempTs)) fs.unlinkSync(tempTs); } catch (_) {}
+  }
+}
+
 // API: Featured / Home content (New Releases, Trending, Dramas)
 app.get('/api/featured', async (req, res) => {
   const now = Date.now();
@@ -405,23 +478,8 @@ async function executeDownloadJob(jobId, movieId, title, season, finalFilePath, 
 
         const m3u8Url = streamData.streams[0].signedVideoUrl;
 
-        // Download stream memory-safely with reconnection and AAC bitstream fix
-        await runFFmpeg([
-          '-y',
-          '-threads', '1',
-          '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-          '-reconnect', '1',
-          '-reconnect_at_eof', '1',
-          '-reconnect_streamed', '1',
-          '-reconnect_delay_max', '5',
-          '-headers', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n',
-          '-i', m3u8Url,
-          '-c', 'copy',
-          '-bsf:a', 'aac_adtstoasc',
-          '-movflags', '+faststart',
-          '-f', 'mp4',
-          outFile
-        ]);
+        // Stream segments directly via native Node.js fetch, then remux locally (zero SIGSEGV)
+        await downloadHlsToMp4(m3u8Url, outFile, tempDir);
 
         downloadedFiles[overallIdx] = outFile;
         job.currentEpisode++;
